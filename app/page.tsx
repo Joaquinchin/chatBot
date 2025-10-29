@@ -9,7 +9,7 @@ export default function ChatPage() {
     api: '/api/chat', // Endpoint del backend
   });
 
-  // Ref para hacer scroll automático al último mensaje
+  // Ref para hacer scroll automático al menaje más reciente
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   // Log para debug
