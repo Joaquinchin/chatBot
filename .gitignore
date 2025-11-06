@@ -37,6 +37,12 @@ yarn-error.log*
 .env.test.local
 .env.production.local
 
+# Base de datos SQLite
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
 # vercel
 .vercel
 

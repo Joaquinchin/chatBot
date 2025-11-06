@@ -1,18 +1,15 @@
 'use client';
 
-import { useChat } from 'ai/react';
+import { useChat } from 'ai/react'; // ← Cambia de 'ai/react' a 'ai/rsc'
 import { useEffect, useRef } from 'react';
 
 export default function ChatPage() {
-  // Hook de Vercel AI SDK - Maneja TODO el estado del chat automáticamente
   const { messages, input, handleInputChange, handleSubmit, isLoading, error } = useChat({
-    api: '/api/chat', // Endpoint del backend
+    api: '/api/chat',
   });
 
-  // Ref para hacer scroll automático al menaje más reciente
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Log para debug
   useEffect(() => {
     console.log('📩 Mensajes actuales:', messages);
     messages.forEach((msg, i) => {
@@ -27,14 +24,12 @@ export default function ChatPage() {
     console.log('❌ Error:', error);
   }, [messages, isLoading, error]);
 
-  // Scroll automático cuando hay nuevos mensajes
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   return (
     <div className="flex flex-col h-screen bg-white">
-      {/* Header */}
       <header className="bg-green-600 shadow-md p-4">
         <div className="max-w-4xl mx-auto">
           <h1 className="text-xl font-semibold text-white text-center">
@@ -46,7 +41,6 @@ export default function ChatPage() {
         </div>
       </header>
 
-      {/* Área de mensajes con fondo tipo WhatsApp */}
       <div 
         className="flex-1 overflow-y-auto p-4"
         style={{
@@ -56,7 +50,6 @@ export default function ChatPage() {
       >
         <div className="max-w-4xl mx-auto space-y-3 pb-4">
           {messages.length === 0 ? (
-            // Pantalla de bienvenida
             <div className="text-center mt-20 space-y-3">
               <div className="bg-white/90 rounded-lg shadow-md p-6 max-w-sm mx-auto">
                 <h2 className="text-xl font-semibold text-gray-700 mb-2">
@@ -68,7 +61,6 @@ export default function ChatPage() {
               </div>
             </div>
           ) : (
-            // Mensajes del chat
             messages.map((message) => (
               <div
                 key={message.id}
@@ -96,7 +88,6 @@ export default function ChatPage() {
             ))
           )}
 
-          {/* Indicador de carga */}
           {isLoading && (
             <div className="flex justify-start">
               <div className="bg-white text-gray-800 rounded-lg rounded-bl-none px-4 py-3 shadow-md max-w-[75%]">
@@ -112,7 +103,6 @@ export default function ChatPage() {
             </div>
           )}
 
-          {/* Mostrar errores */}
           {error && (
             <div className="bg-red-100 border border-red-300 text-red-800 rounded-lg p-3 max-w-[75%] mx-auto shadow-md">
               <p className="font-semibold text-sm">Error</p>
@@ -125,12 +115,10 @@ export default function ChatPage() {
             </div>
           )}
 
-          {/* Ref para scroll automático */}
           <div ref={messagesEndRef} />
         </div>
       </div>
 
-      {/* Formulario de entrada tipo WhatsApp */}
       <div className="bg-gray-100 border-t border-gray-300 p-3">
         <form
           onSubmit={handleSubmit}
