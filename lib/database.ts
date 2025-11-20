@@ -33,9 +33,7 @@ db.exec(`
 
 console.log('✅ Base de datos inicializada en:', dbPath);
 
-// ==========================================
 // FUNCIONES PARA READING LIST
-// ==========================================
 
 export function addToReadingList(bookData: {
   bookId: string;
@@ -99,10 +97,7 @@ export function removeFromReadingList(bookId: string) {
   }
 }
 
-// ==========================================
 // FUNCIONES PARA BOOKS READ
-// ==========================================
-
 export function markAsRead(bookData: {
   bookId: string;
   title: string;
@@ -113,10 +108,10 @@ export function markAsRead(bookData: {
   pageCount?: number;
   dateFinished?: string;
 }) {
-  // Primero, eliminar de reading_list si está ahí
+  // Primero eliminar de reading_list 
   db.prepare('DELETE FROM reading_list WHERE book_id = ?').run(bookData.bookId);
 
-  // Luego, agregar a books_read
+  // agregar a books_read
   const stmt = db.prepare(`
     INSERT INTO books_read (book_id, title, authors, thumbnail, rating, review, page_count, date_finished)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -152,10 +147,7 @@ export function getBooksRead(limit?: number) {
   
   return db.prepare(query).all();
 }
-
-// ==========================================
 // ESTADÍSTICAS
-// ==========================================
 
 export function getReadingStats(period?: 'all-time' | 'year' | 'month') {
   let dateFilter = '';

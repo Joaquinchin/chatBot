@@ -7,8 +7,8 @@ import {
   getReadingStats 
 } from '@/lib/database';
 
-if (!process.env.OPENROUTER_API_KEY) {
-  throw new Error('OPENROUTER_API_KEY no está configurada');
+if (!process.env.DEEPSEEK_API_KEY) {
+  throw new Error('DEEPSEEK_API_KEY no está configurada');
 }
 
 // CAMBIO: De 'edge' a 'nodejs' porque SQLite no funciona en Edge Runtime
@@ -186,7 +186,18 @@ async function executeToolCall(toolName: string, args: any) {
         limit: args.limit
       });
       console.log(`📚 Lista de lectura: ${readingList.length} libros`);
-      return readingList;
+      
+      // Formatear para que sea compatible con BooksGrid
+      const formattedList = readingList.map((book: any) => ({
+        id: book.book_id,
+        title: book.title,
+        authors: book.authors,
+        thumbnail: book.thumbnail,
+        description: book.notes || 'Sin notas adicionales',
+        categories: `Prioridad: ${book.priority} • Agregado: ${new Date(book.date_added).toLocaleDateString('es-ES')}`
+      }));
+      
+      return formattedList;
       
     case 'markAsRead':
       // Obtener info del libro
@@ -221,8 +232,32 @@ export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
 
+    // Validar y sanitizar inputs
+    if (!messages || !Array.isArray(messages)) {
+      return new Response(
+        JSON.stringify({ error: 'Formato de mensajes inválido' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    // Sanitizar cada mensaje
+    const sanitizedMessages = messages.map(msg => ({
+      ...msg,
+      content: typeof msg.content === 'string' 
+        ? msg.content.trim().slice(0, 1000) // Limitar longitud
+        : ''
+    }));
+
+    // Validar que hay al menos un mensaje
+    if (sanitizedMessages.length === 0) {
+      return new Response(
+        JSON.stringify({ error: 'No hay mensajes para procesar' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
     console.log('🔧 Iniciando chat con tool calling');
-    console.log('📩 Mensajes recibidos:', messages.length);
+    console.log('📩 Mensajes recibidos:', sanitizedMessages.length);
 
     // Preparar los mensajes con el system prompt
     const allMessages = [
@@ -244,28 +279,43 @@ Cuando muestres resultados de búsqueda:
 
 Siempre responde en español.`
       },
-      ...messages
+      ...sanitizedMessages
     ];
 
-    // Llamar a OpenRouter con tool calling habilitado
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.OPENROUTER_MODEL || 'mistralai/mistral-7b-instruct:free',
-        messages: allMessages,
-        tools,
-        tool_choice: 'auto',
-        stream: true,
-      }),
-    });
+    // Llamar a DeepSeek con tool calling habilitado
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 segundos timeout
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(`OpenRouter error: ${JSON.stringify(errorData)}`);
+    let response;
+    try {
+      response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: allMessages,
+          tools,
+          tool_choice: 'auto',
+          stream: true,
+        }),
+        signal: controller.signal, // Agregar timeout
+      });
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`DeepSeek error: ${JSON.stringify(errorData)}`);
+      }
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error('Request timeout: El modelo tardó demasiado en responder. Intenta con un modelo más rápido.');
+      }
+      throw error;
     }
 
     // Crear stream de respuesta
@@ -326,12 +376,22 @@ Siempre responde en español.`
 
                 // Enviar contenido de texto normal
                 if (delta?.content) {
-                  const content = delta.content
+                  let content = delta.content
                     .replace(/\[\/s>/g, '')
                     .replace(/<\/s>/g, '')
                     .replace(/<s>/g, '');
 
-                  if (content) {
+                  // Filtrar marcadores de tools que el LLM genera incorrectamente
+                  content = content
+                    .replace(/__TOOL_START__\w+__TOOL_START__/g, '')
+                    .replace(/\|_tool_sep_\|/g, '')
+                    .replace(/>\{"bookId":/g, '')
+                    .replace(/>_tool_call_end_\|/g, '')
+                    .replace(/_tool_calls_end_\|/g, '')
+                    .replace(/\|_tool_call_end_\|/g, '')
+                    .replace(/><\|/g, '');
+
+                  if (content.trim()) {
                     const escaped = content
                       .replace(/\\/g, '\\\\')
                       .replace(/"/g, '\\"')
@@ -353,61 +413,44 @@ Siempre responde en español.`
                         const args = JSON.parse(toolCall.function.arguments);
                         const result = await executeToolCall(toolCall.function.name, args);
                         
-                        // Formatear y enviar el resultado
-                        let resultText = '';
+                        // Enviar resultados formateados según el tipo de tool
+                        let formattedResult = '';
                         
-                        if (toolCall.function.name === 'searchBooks') {
-                          resultText = '\n\n📚 Libros encontrados:\n\n';
-                          result.forEach((book: any, index: number) => {
-                            resultText += `${index + 1}. "${book.title}" - ${book.authors}\n`;
-                            resultText += `   ${book.description}\n`;
-                            resultText += `   Categorías: ${book.categories}\n`;
-                            resultText += `   ID: ${book.id}\n\n`;
-                          });
-                        } else if (toolCall.function.name === 'getBookDetails') {
-                          resultText = `\n\n📖 Detalles del libro:\n\n`;
-                          resultText += `Título: ${result.title}\n`;
-                          resultText += `Autor(es): ${result.authors}\n`;
-                          resultText += `Páginas: ${result.pageCount}\n`;
-                          resultText += `Editorial: ${result.publisher}\n`;
-                          resultText += `Fecha: ${result.publishedDate}\n`;
-                          resultText += `Categorías: ${result.categories}\n`;
-                          resultText += `ID: ${result.id}\n\n`;
-                          resultText += `Descripción: ${result.description}\n`;
-                        } else if (toolCall.function.name === 'addToReadingList') {
-                          resultText = `\n\n✅ ${result.message}\n`;
-                        } else if (toolCall.function.name === 'getReadingList') {
-                          if (result.length === 0) {
-                            resultText = '\n\n📚 Tu lista de lectura está vacía.\n';
-                          } else {
-                            resultText = `\n\n📚 Tu lista de lectura (${result.length} libros):\n\n`;
-                            result.forEach((book: any, index: number) => {
-                              resultText += `${index + 1}. "${book.title}" - ${book.authors}\n`;
-                              resultText += `   Prioridad: ${book.priority}\n`;
-                              if (book.notes) resultText += `   Notas: ${book.notes}\n`;
-                              resultText += `   Agregado: ${new Date(book.date_added).toLocaleDateString()}\n`;
-                              resultText += `   ID: ${book.book_id}\n\n`;
-                            });
-                          }
-                        } else if (toolCall.function.name === 'markAsRead') {
-                          resultText = `\n\n✅ ${result.message}\n`;
+                        if (toolCall.function.name === 'searchBooks' && Array.isArray(result)) {
+                          // Enviar JSON embebido para que el frontend lo parsee
+                          formattedResult = `\n\n<<BOOKS_DATA>>${JSON.stringify(result)}<<BOOKS_DATA>>\n\n`;
+                        } else if (toolCall.function.name === 'getReadingList' && Array.isArray(result)) {
+                          formattedResult = `\n\n<<READING_LIST_DATA>>${JSON.stringify(result)}<<READING_LIST_DATA>>\n\n`;
                         } else if (toolCall.function.name === 'getReadingStats') {
-                          resultText = `\n\n📊 Tus estadísticas de lectura (${result.period}):\n\n`;
-                          resultText += `📚 Libros leídos: ${result.totalBooksRead}\n`;
-                          resultText += `📖 Páginas leídas: ${result.totalPagesRead}\n`;
-                          resultText += `⭐ Rating promedio: ${result.averageRating}/5\n`;
-                          resultText += `✍️ Autor favorito: ${result.favoriteAuthor} (${result.favoriteAuthorCount} libros)\n`;
-                          resultText += `📋 Libros pendientes: ${result.pendingBooks}\n`;
+                          formattedResult = `\n\n<<STATS_DATA>>${JSON.stringify(result)}<<STATS_DATA>>\n\n`;
+                        } else if (toolCall.function.name === 'addToReadingList') {
+                          formattedResult = `\n\n✅ ${result.message}\n\n`;
+                        } else if (toolCall.function.name === 'markAsRead') {
+                          formattedResult = `\n\n✅ ${result.message}\n\n`;
+                        } else if (toolCall.function.name === 'getBookDetails') {
+                          formattedResult = `\n\n📖 **${result.title}**\n`;
+                          formattedResult += `Autor(es): ${result.authors}\n`;
+                          formattedResult += `Páginas: ${result.pageCount || 'N/A'}\n`;
+                          if (result.publisher) formattedResult += `Editorial: ${result.publisher}\n`;
+                          if (result.publishedDate) formattedResult += `Fecha: ${result.publishedDate}\n`;
+                          formattedResult += `\n${result.description}\n\n`;
                         }
                         
-                        const escaped = resultText
+                        const escapedResult = formattedResult
                           .replace(/\\/g, '\\\\')
                           .replace(/"/g, '\\"')
                           .replace(/\n/g, '\\n');
                         
-                        controller.enqueue(encoder.encode(`0:"${escaped}"\n`));
+                        controller.enqueue(encoder.encode(`0:"${escapedResult}"\n`));
+                        
                       } catch (toolError) {
                         console.error('Error ejecutando tool:', toolError);
+                        const errorMsg = `\n\n❌ Error: ${toolError instanceof Error ? toolError.message : 'Error desconocido'}\n`;
+                        const escapedError = errorMsg
+                          .replace(/\\/g, '\\\\')
+                          .replace(/"/g, '\\"')
+                          .replace(/\n/g, '\\n');
+                        controller.enqueue(encoder.encode(`0:"${escapedError}"\n`));
                       }
                     }
                   }
