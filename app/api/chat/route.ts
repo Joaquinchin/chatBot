@@ -10,11 +10,9 @@ import {
 if (!process.env.DEEPSEEK_API_KEY) {
   throw new Error('DEEPSEEK_API_KEY no está configurada');
 }
-
-// CAMBIO: De 'edge' a 'nodejs' porque SQLite no funciona en Edge Runtime
 export const runtime = 'nodejs';
 
-// Definir el schema de las herramientas en formato OpenAI
+// Definir el schema de las herramientas en formato deepseek
 const tools = [
   {
     type: "function",
@@ -317,45 +315,72 @@ Siempre responde en español.`
       }
       throw error;
     }
-
-    // Crear stream de respuesta
+    // DeepSeek manda la respuesta de a pedacitos (chunks), no todo junto de una.
+    // La respuesta viene en formato SSE (Server-Sent Events), que son líneas tipo:
+    // data: {"choices":[{"delta":{"content":"Hola"}}]}
+    // data: {"choices":[{"delta":{"content":" mundo"}}]}
+    // data: [DONE]
+    //
+    // El tema es que a veces los chunks vienen cortados a la mitad, tipo:
+    // Chunk 1: "data: {\"choices\":[{\"delta\":"
+    // Chunk 2: "{\"content\":\"Hola\"}}]}\n"
+    // Por eso necesitás un BUFFER que acumule hasta tener líneas completas.
+    
     const stream = new ReadableStream({
       async start(controller) {
+        // Agarramos el reader del response de DeepSeek para leer de a cachitos
         const reader = response.body?.getReader();
         if (!reader) {
           controller.close();
           return;
         }
 
+        // buffer: acumula texto hasta que tengamos líneas completas
+        // toolCallsBuffer: cuando DeepSeek quiere llamar una tool (ej: searchBooks), 
+        //                  te la manda en pedazos aca  juntamos todas antes de ejecutar.
         let buffer = '';
         let toolCallsBuffer: any[] = [];
 
         try {
+          // Loop infinito leyendo chunks hasta que DeepSeek termine
           while (true) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) break; // DeepSeek terminó de mandar todo
 
+            // value es un Uint8Array (bytes), lo pasamos a string
             buffer += decoder.decode(value, { stream: true });
+            
+            // Cortamos por \n para procesar línea por línea
             const lines = buffer.split('\n');
+            // La última línea probablemente está incompleta, la guardamos en el buffer
             buffer = lines.pop() || '';
 
+            // Procesamos cada línea completa
             for (const line of lines) {
               const trimmedLine = line.trim();
+              // DeepSeek manda líneas vacías o que no empiezan con "data:", las skippeamos
               if (!trimmedLine || !trimmedLine.startsWith('data: ')) continue;
 
+              // Le sacamos el "data: " del principio
               const data = trimmedLine.slice(6);
+              // "[DONE]" significa que DeepSeek terminó
               if (data === '[DONE]') continue;
 
               try {
                 const parsed = JSON.parse(data);
                 const delta = parsed.choices?.[0]?.delta;
 
-                // Manejar tool calls
+                // CASO 1: DeepSeek quiere usar una tool (ej: buscar libros)
+                // Los tool calls vienen en pedazos, tipo:
+                // Chunk 1: {"tool_calls":[{"index":0,"function":{"name":"search"}}]}
+                // Chunk 2: {"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]}
+                // Chunk 3: {"tool_calls":[{"index":0,"function":{"arguments":"\"Harry Potter\"}"}}]}
+                // Tenemos que juntarlos todos antes de ejecutar
                 if (delta?.tool_calls) {
                   console.log('🔧 Tool calls detectados:', delta.tool_calls);
                   
                   for (const toolCall of delta.tool_calls) {
-                    // Acumular tool calls
+                    // Si no existe el índice, lo creamos
                     if (!toolCallsBuffer[toolCall.index]) {
                       toolCallsBuffer[toolCall.index] = {
                         id: toolCall.id,
@@ -364,6 +389,7 @@ Siempre responde en español.`
                       };
                     }
                     
+                    // Vamos concatenando el nombre y los argumentos
                     if (toolCall.function?.name) {
                       toolCallsBuffer[toolCall.index].function.name = toolCall.function.name;
                     }
@@ -374,14 +400,17 @@ Siempre responde en español.`
                   }
                 }
 
-                // Enviar contenido de texto normal
+                // CASO 2: Texto normal del LLM (el chat común)
                 if (delta?.content) {
                   let content = delta.content
+                    // DeepSeek a veces mete tokens raros como <s>, </s>, los limpiamos
                     .replace(/\[\/s>/g, '')
                     .replace(/<\/s>/g, '')
                     .replace(/<s>/g, '');
 
-                  // Filtrar marcadores de tools que el LLM genera incorrectamente
+                  // A veces DeepSeek se bugea y escribe sus propios marcadores de tools
+                  // tipo "__TOOL_START__searchBooks" en vez de usar el sistema correcto.
+                  // Los filtramos para que no aparezcan en pantalla.
                   content = content
                     .replace(/__TOOL_START__\w+__TOOL_START__/g, '')
                     .replace(/\|_tool_sep_\|/g, '')
@@ -392,42 +421,50 @@ Siempre responde en español.`
                     .replace(/><\|/g, '');
 
                   if (content.trim()) {
+                    // Escapamos caracteres especiales porque lo mandamos como string JSON
                     const escaped = content
                       .replace(/\\/g, '\\\\')
                       .replace(/"/g, '\\"')
                       .replace(/\n/g, '\\n')
                       .replace(/\r/g, '\\r')
                       .replace(/\t/g, '\\t');
-
+                    // El formato 0:"texto" es el que espera el hook useChat de Vercel AI SDK
                     controller.enqueue(encoder.encode(`0:"${escaped}"\n`));
                   }
                 }
 
-                // Si la respuesta terminó y hay tool calls pendientes
+                // CASO 3: DeepSeek terminó de mandar los tool calls, ahora los ejecutamos
+                // finish_reason === 'tool_calls' significa "che, ejecutá estas funciones"
                 if (parsed.choices?.[0]?.finish_reason === 'tool_calls' && toolCallsBuffer.length > 0) {
                   console.log('🎯 Ejecutando tool calls acumulados');
                   
+                  // Ejecutamos cada tool call que juntamos
                   for (const toolCall of toolCallsBuffer) {
                     if (toolCall.function.name && toolCall.function.arguments) {
                       try {
+                        // Los argumentos vienen como string JSON, los parseamos
                         const args = JSON.parse(toolCall.function.arguments);
+                        // Llamamos a la función (searchBooks, addToReadingList, etc.)
                         const result = await executeToolCall(toolCall.function.name, args);
                         
-                        // Enviar resultados formateados según el tipo de tool
+                        // Formateamos el resultado según qué tool fue
                         let formattedResult = '';
                         
                         if (toolCall.function.name === 'searchBooks' && Array.isArray(result)) {
-                          // Enviar JSON embebido para que el frontend lo parsee
+                          // Mandamos el JSON entre marcadores <<BOOKS_DATA>>...<<BOOKS_DATA>>
+                          // El frontend (page.tsx) busca estos marcadores y renderiza las cards
                           formattedResult = `\n\n<<BOOKS_DATA>>${JSON.stringify(result)}<<BOOKS_DATA>>\n\n`;
                         } else if (toolCall.function.name === 'getReadingList' && Array.isArray(result)) {
                           formattedResult = `\n\n<<READING_LIST_DATA>>${JSON.stringify(result)}<<READING_LIST_DATA>>\n\n`;
                         } else if (toolCall.function.name === 'getReadingStats') {
                           formattedResult = `\n\n<<STATS_DATA>>${JSON.stringify(result)}<<STATS_DATA>>\n\n`;
                         } else if (toolCall.function.name === 'addToReadingList') {
+                          // Estos solo muestran un mensaje de confirmación
                           formattedResult = `\n\n✅ ${result.message}\n\n`;
                         } else if (toolCall.function.name === 'markAsRead') {
                           formattedResult = `\n\n✅ ${result.message}\n\n`;
                         } else if (toolCall.function.name === 'getBookDetails') {
+                          // Formateamos bonito los detalles del libro
                           formattedResult = `\n\n📖 **${result.title}**\n`;
                           formattedResult += `Autor(es): ${result.authors}\n`;
                           formattedResult += `Páginas: ${result.pageCount || 'N/A'}\n`;
@@ -436,6 +473,7 @@ Siempre responde en español.`
                           formattedResult += `\n${result.description}\n\n`;
                         }
                         
+                        // Escapamos y mandamos al frontend
                         const escapedResult = formattedResult
                           .replace(/\\/g, '\\\\')
                           .replace(/"/g, '\\"')
@@ -455,7 +493,7 @@ Siempre responde en español.`
                     }
                   }
                   
-                  // Limpiar buffer
+                  // Limpiamos el buffer para la próxima
                   toolCallsBuffer = [];
                 }
 
@@ -465,7 +503,7 @@ Siempre responde en español.`
             }
           }
 
-          // Procesar buffer restante
+          // Si quedó algo en el buffer al final (última línea incompleta), la procesamos
           if (buffer.trim()) {
             const trimmedLine = buffer.trim();
             if (trimmedLine.startsWith('data: ')) {
@@ -499,6 +537,7 @@ Siempre responde en español.`
           console.error('Stream error:', error);
           controller.error(error);
         } finally {
+          // Siempre cerramos el stream al terminar
           controller.close();
         }
       },
